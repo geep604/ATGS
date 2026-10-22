@@ -39,7 +39,8 @@ def multithread_write(image_list, path, render_view_id, global_start_frames):
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=None)
     def write_image(image, count, path):
         try:
-            torchvision.utils.save_image(image, os.path.join(path, str(render_view_id), '{0:05d}'.format(count) + ".jpg"))
+            # S4GS: lossless PNG (docs/eval-protocol.md section 3 compares 8-bit PNGs), upstream writes .jpg
+            torchvision.utils.save_image(image, os.path.join(path, str(render_view_id), '{0:05d}'.format(count) + ".png"))
             return count, True
         except:
             return count, False
@@ -189,9 +190,10 @@ def render_set(opt,model_path, name, iteration, views, gaussians, pipeline, back
 
     per_frame_one_view = frames_start_end[1] - frames_start_end[0]
 
-    # render_view_ids = [0, 1, 2, 3]
-    render_view_ids = [0, 1]
-    
+    # S4GS: every camera of the split, view k = k-th camera (upstream: render_view_ids = [0, 1], the first two only)
+    assert len(views) % per_frame_one_view == 0, f"{len(views)} images is not a multiple of {per_frame_one_view} frames"
+    render_view_ids = list(range(len(views) // per_frame_one_view))
+
     global_start_frames = frames_start_end[0]
     global_end_frames = frames_start_end[1]
 
@@ -236,7 +238,39 @@ def render_set(opt,model_path, name, iteration, views, gaussians, pipeline, back
             multithread_write(gt_list, gts_path, render_view_id, global_start_frames + (end_frame - start_frame) - len(render_list))
             multithread_write(render_list, render_path, render_view_id, global_start_frames + (end_frame - start_frame) - len(render_list))
 
-def render_sets( opt , hyper, dataset : ModelParams, frames_start_end, iteration : int, pipeline : PipelineParams,  skip_train : bool, skip_test : bool, skip_video: bool):
+def fps_set(opt, name, iteration, views, gaussians, pipeline, background):
+    """S4GS: speed measurement (docs/eval-protocol.md section 4). Renders every view of the split once, writes NO file and reads
+    no ground truth, and prints the mean per-view render speed.
+
+    A view is timed from the visibility prefilter to the rendered image (prefilter_voxel + render: time mask, hash-grid
+    encoders, MLPs, rasterizer), with torch.cuda.synchronize() before and after (the upstream timers in render_set /
+    render_set_virtual do not synchronise). Loading the image / building the camera (views[idx]) is not timed. Like render.py of
+    this repo, the first view is run three times and the last run is its time (warm-up of the CUDA kernels, tiny-cuda-nn and the
+    allocator); every view then counts once, and the FPS is 1 / mean(per-view time) over all views of all test cameras.
+    """
+    times = []
+    n_gaussians = []
+    print("anchors:", gaussians._anchor.shape[0], "| views:", len(views))
+    with torch.no_grad():
+        for idx in tqdm(range(len(views)), desc="FPS"):
+            view = views[idx]
+            for _ in range(3 if idx == 0 else 1):
+                torch.cuda.synchronize()
+                t_start = time()
+                voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
+                render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask)
+                torch.cuda.synchronize()
+                t_end = time()
+            times.append(t_end - t_start)
+            n_gaussians.append(int(render_pkg["radii"].shape[0]))
+            del render_pkg
+    mean_t = sum(times) / len(times)
+    print(f"Render FPS {1.0 / mean_t:.2f} (per view, {len(times)} {name} views of iteration {iteration}, mean {1000 * mean_t:.2f} ms, "
+          f"{sum(n_gaussians) / len(n_gaussians):.0f} neural Gaussians per view, {gaussians._anchor.shape[0]} anchors)")
+    print(f"FPS_ONLY fps={1.0 / mean_t:.6f} views={len(times)} mean_ms={1000 * mean_t:.4f} anchors={gaussians._anchor.shape[0]} "
+          f"gaussians_per_view={sum(n_gaussians) / len(n_gaussians):.1f}")
+
+def render_sets( opt , hyper, dataset : ModelParams, frames_start_end, iteration : int, pipeline : PipelineParams,  skip_train : bool, skip_test : bool, skip_video: bool, fps_only: bool = False):
     with torch.no_grad():
         gaussians = GaussianModel(hyper, opt,dataset.feat_dim, 10, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
@@ -245,6 +279,10 @@ def render_sets( opt , hyper, dataset : ModelParams, frames_start_end, iteration
         cam_type=scene.dataset_type
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+        if fps_only:  # S4GS: speed only, no file is written (the test views are the ones of the quality table)
+            fps_set(opt, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
+            return
 
         if not skip_train:
             render_set(opt,dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background,cam_type, frames_start_end)
@@ -270,6 +308,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--skip_video", action="store_true")
+    parser.add_argument("--fps_only", action="store_true", help="S4GS: render all test views without writing anything and print the mean per-view FPS")
     parser.add_argument("--configs", type=str)
     parser.add_argument("--frames_start_end", type=int, nargs=2, default=[0, 300], help="Start and end frames")
 
@@ -290,5 +329,5 @@ if __name__ == "__main__":
     apply_atgs_cfg(args)
 
     for i_iteration in args.iteration:
-        render_sets(op.extract(args), hp.extract(args),   model.extract(args), args.frames_start_end, i_iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.skip_video)
+        render_sets(op.extract(args), hp.extract(args),   model.extract(args), args.frames_start_end, i_iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.skip_video, args.fps_only)
     
