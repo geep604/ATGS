@@ -335,7 +335,8 @@ class Colmap_Dataset(Dataset):
         return len(self.image_paths)
     
     def __getitem__(self,index):
-        img = Image.open(self.image_paths[index])
+        # S4GS: HiFi4G stores some all-white frames as palette / 1-bit PNGs; without the conversion the GT has one channel.
+        img = Image.open(self.image_paths[index]).convert("RGB")
         if self.downsample != 1.0:
             img = img.resize(self.img_whs[int(index / (self.N_frames))], Image.LANCZOS)
         img = self.transform(img)   # toTensor

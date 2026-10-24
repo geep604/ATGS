@@ -148,7 +148,11 @@ def render_set_virtual(opt,model_path, name, iteration, views, gaussians, pipeli
             voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background, gop_id=0)
             retain_grad = (iteration < opt.update_until and iteration >= 0)
             # rendering = render(view, gaussians, pipeline, background, render_anchor="all", visible_mask=voxel_visible_mask, retain_grad=retain_grad)["render"]
-            rendering = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)["render"]
+            if not bool(voxel_visible_mask.any()):  # S4GS: no visible anchor -> background image instead of a crash in the dynamic module
+                print(f"no visible anchor for view {idx} (time {float(view.time):.4f}): background rendered", flush=True)
+                rendering = background.view(3, 1, 1).expand(3, int(view.image_height), int(view.image_width)).clone()
+            else:
+                rendering = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)["render"]
 
            
             time2 = time()
@@ -212,7 +216,11 @@ def render_set(opt,model_path, name, iteration, views, gaussians, pipeline, back
             voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
             retain_grad = (iteration < opt.update_until and iteration >= 0)
             # rendering = render(view, gaussians, pipeline, background, render_anchor="all", visible_mask=voxel_visible_mask, retain_grad=retain_grad)["render"]
-            rendering = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)["render"]
+            if not bool(voxel_visible_mask.any()):  # S4GS: no visible anchor -> background image instead of a crash in the dynamic module
+                print(f"no visible anchor for view {idx} (time {float(view.time):.4f}): background rendered", flush=True)
+                rendering = background.view(3, 1, 1).expand(3, int(view.image_height), int(view.image_width)).clone()
+            else:
+                rendering = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)["render"]
             time2 = time()
             all_time += (time2-time1)
 
@@ -251,19 +259,28 @@ def fps_set(opt, name, iteration, views, gaussians, pipeline, background):
     times = []
     n_gaussians = []
     print("anchors:", gaussians._anchor.shape[0], "| views:", len(views))
+    skipped_views = 0  # S4GS: views without a visible anchor are not timed
     with torch.no_grad():
         for idx in tqdm(range(len(views)), desc="FPS"):
             view = views[idx]
+            render_pkg = None
             for _ in range(3 if idx == 0 else 1):
                 torch.cuda.synchronize()
                 t_start = time()
                 voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
+                if not bool(voxel_visible_mask.any()):  # S4GS: the renderer would crash on this view
+                    break
                 render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask)
                 torch.cuda.synchronize()
                 t_end = time()
+            if render_pkg is None:
+                skipped_views += 1
+                continue
             times.append(t_end - t_start)
             n_gaussians.append(int(render_pkg["radii"].shape[0]))
             del render_pkg
+    if skipped_views:
+        print(f"FPS: {skipped_views} views skipped (no visible anchor)", flush=True)
     mean_t = sum(times) / len(times)
     print(f"Render FPS {1.0 / mean_t:.2f} (per view, {len(times)} {name} views of iteration {iteration}, mean {1000 * mean_t:.2f} ms, "
           f"{sum(n_gaussians) / len(n_gaussians):.0f} neural Gaussians per view, {gaussians._anchor.shape[0]} anchors)")

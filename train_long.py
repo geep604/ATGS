@@ -32,7 +32,7 @@ import torchvision.transforms.functional as tf
 import lpips
 from random import randint
 from utils.loss_utils import l1_loss, ssim, LikelihoodLoss, factor_loss
-from gaussian_renderer import prefilter_voxel, render, network_gui
+from gaussian_renderer import prefilter_voxel, render, network_gui, get_time_mask_by_window
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -378,6 +378,21 @@ def scene_reconstruction(dataset, hyper, opt, pipe, testing_iterations, saving_i
         gaussians.update_learning_rate(iteration, opt, viewpoint_cam.time)
 
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
+        # S4GS: a view without a visible anchor crashes in the dynamic module (time[0] of an empty tensor; HiFi4G Guzheng,
+        # iteration 40). Report the view and the anchors; stop if the model is non-finite, otherwise draw another view.
+        redraws = 0
+        while not bool(voxel_visible_mask.any()):
+            _tm = get_time_mask_by_window(gaussians, viewpoint_cam.time)
+            _bad = int((~torch.isfinite(gaussians.get_anchor[_tm])).any(1).sum()) + int((~torch.isfinite(gaussians.get_scaling[_tm])).any(1).sum())
+            msg = (f"[S4GS] no visible anchor at iteration {iteration}: view {getattr(viewpoint_cam, 'image_path', '?')}, time {float(viewpoint_cam.time):.4f}, "
+                   f"{int(_tm.sum())} anchors in the time window ({int(gaussians.get_anchor.shape[0])} total), {_bad} with non-finite position/scale, "
+                   f"image {int(viewpoint_cam.image_width)}x{int(viewpoint_cam.image_height)}, FoV {float(viewpoint_cam.FoVx):.4f}/{float(viewpoint_cam.FoVy):.4f}")
+            if _bad or redraws >= 20:
+                raise RuntimeError(msg + (" -> model diverged" if _bad else " -> 20 views in a row"))
+            print(msg + " -> another view drawn", flush=True)
+            redraws += 1
+            viewpoint_cam = viewpoint_stack[randint(0, len(viewpoint_stack) - 1)]
+            voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, iteration=iteration,
